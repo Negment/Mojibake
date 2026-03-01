@@ -10,6 +10,7 @@
         button { display: block; margin: 0 auto 15px auto; padding: 8px 16px; cursor: pointer; font-weight: bold; }
         .container { display: flex; flex-direction: column; }
         #status { text-align: center; color: #555; font-size: 0.9em; margin-bottom: 10px; height: 1.2em;}
+        .limit-container { text-align: center; margin-top: -10px; margin-bottom: 15px; font-size: 0.9em; color: #333; }
     </style>
 </head>
 <body>
@@ -24,11 +25,16 @@
     <textarea id="garbledText"></textarea>
 
     <button id="restoreBtn">復号化ボタン（下に出力）</button>
+    
+    <div class="limit-container">
+        <label for="maxLimit">最大表示個数:</label>
+        <input type="number" id="maxLimit" value="256" style="width: 70px; font-size: 0.9em;">
+    </div>
 
     <div id="status"></div>
 
     <label for="restoredText">復元した文字列テキストエリア</label>
-    <textarea id="restoredText"></textarea>
+    <textarea id="restoredText" style="height: 150px;"></textarea>
 </div>
 
 <script>
@@ -43,10 +49,45 @@
         document.getElementById('garbledText').value = garbledStr;
     });
 
+    // 一般の復号(非可逆)用の逆引きマップ作成
+    const sjisToBytes = new Map();
+    const tempDecoder = new TextDecoder('shift-jis', {fatal: false});
+    
+    // 1バイト文字のマッピング
+    for (let i = 0; i <= 0xFF; i++) {
+        if ((i >= 0x81 && i <= 0x9F) || (i >= 0xE0 && i <= 0xFC)) continue;
+        const str = tempDecoder.decode(new Uint8Array([i]));
+        if (str !== "\uFFFD" && !sjisToBytes.has(str)) sjisToBytes.set(str, [i]);
+    }
+    // 2バイト文字のマッピング
+    for (let i = 0x81; i <= 0xFC; i++) {
+        if ((i >= 0x81 && i <= 0x9F) || (i >= 0xE0 && i <= 0xFC)) {
+            for (let j = 0x40; j <= 0xFC; j++) {
+                if (j === 0x7F) continue;
+                const str = tempDecoder.decode(new Uint8Array([i, j]));
+                if (str !== "\uFFFD" && !sjisToBytes.has(str)) sjisToBytes.set(str, [i, j]);
+            }
+        }
+    }
+
+    // 一般の復号(非可逆)予測ロジック
+    // (サロゲートペア対応のため for...of を使用)
+    function getStandardDecodedText(str) {
+        const bytes = [];
+        for (const char of str) {
+            const b = sjisToBytes.get(char);
+            if (b) {
+                bytes.push(...b);
+            } else {
+                bytes.push(0x3F); // マッピングできない文字(欠損など)は '?' (0x3F) に置換
+            }
+        }
+        return new TextDecoder('utf-8', {fatal: false}).decode(new Uint8Array(bytes));
+    }
+
     // 2. 復号処理 (Web Worker用のコード)
     const workerCode = `
         const encoder = new TextEncoder();
-        // fatal: false にして代替文字(\uFFFD)のロスをシミュレートする
         const decoder = new TextDecoder('shift-jis', {fatal: false});
         
         const charRanges = [
@@ -66,21 +107,19 @@
             }
         }
 
-        // SJISの未確定（持ち越し）バイトのパターン (-1は持ち越しなし)
         const validPbs = [-1];
         for (let i = 0x81; i <= 0x9F; i++) validPbs.push(i);
         for (let i = 0xE0; i <= 0xFC; i++) validPbs.push(i);
 
         const pbToIndex = new Map();
         validPbs.forEach((pb, idx) => pbToIndex.set(pb, idx));
+        const numValidPbs = validPbs.length;
 
-        // 状態遷移の遅延評価用キャッシュ（高速化）
-        const transitions = new Array(validPbs.length);
-        for (let i = 0; i < validPbs.length; i++) {
+        const transitions = new Array(numValidPbs);
+        for (let i = 0; i < numValidPbs; i++) {
             transitions[i] = new Array(candidates.length).fill(null);
         }
 
-        // ストリームデコードを用いて、文字を追加した際の「確定文字列」と「次への持ち越しバイト」を計算する
         function getTransition(pbIndex, cIdx) {
             if (transitions[pbIndex][cIdx]) return transitions[pbIndex][cIdx];
             
@@ -97,71 +136,76 @@
             }
             
             const str = decoder.decode(input, {stream: true});
-            const remainder = decoder.decode(new Uint8Array(0)); // バッファのフラッシュ
+            const remainder = decoder.decode(new Uint8Array(0));
             
             let nextPb = -1;
             if (remainder !== "") {
-                // バッファに解釈待ちが残っている場合、最後の1バイトがSJIS第1バイト
                 nextPb = input[input.length - 1];
             }
             
-            const trans = { str, nextPbIndex: pbToIndex.get(nextPb) };
+            const strCodes = new Uint16Array(str.length);
+            for(let i=0; i<str.length; i++) {
+                strCodes[i] = str.charCodeAt(i);
+            }
+            
+            const trans = { strCodes, nextPbIndex: pbToIndex.get(nextPb) };
             transitions[pbIndex][cIdx] = trans;
             return trans;
         }
 
         self.onmessage = function(e) {
-            const targetM = e.data.targetM;
+            const targetMCodes = e.data.targetMCodes;
+            const targetMLen = targetMCodes.length;
             const startIdx = e.data.startIdx;
             const endIdx = e.data.endIdx;
             
             const results = [];
             let searchCount = 0;
 
-            // Workerに割り当てられた初期文字（1文字目）ごとに独立してDPを実行する
             for (let firstIdx = startIdx; firstIdx < endIdx; firstIdx++) {
-                // dp[mIndex] = Map: pbIndex -> Array of texts
-                const dp = new Array(targetM.length + 1);
-                for(let i = 0; i <= targetM.length; i++) dp[i] = new Map();
+                const dp = new Array(targetMLen + 1);
+                for(let i = 0; i <= targetMLen; i++) {
+                    dp[i] = new Array(numValidPbs).fill(null);
+                }
                 
-                const trans = getTransition(0, firstIdx); // 0は pb=-1 (持ち越しなし)
-                const addedStr = trans.str;
+                const trans = getTransition(0, firstIdx); 
+                const addedCodes = trans.strCodes;
                 
                 let match = true;
-                if (addedStr.length > targetM.length) {
+                if (addedCodes.length > targetMLen) {
                     match = false;
                 } else {
-                    for (let k = 0; k < addedStr.length; k++) {
-                        if (targetM[k] !== addedStr[k]) {
+                    for (let k = 0; k < addedCodes.length; k++) {
+                        if (targetMCodes[k] !== addedCodes[k]) {
                             match = false;
                             break;
                         }
                     }
                 }
                 
-                // 1文字目がターゲットの接頭辞として成立する場合のみ登録
                 if (match) {
-                    const nextIndex = addedStr.length;
-                    const texts = [candidates[firstIdx].char];
-                    dp[nextIndex].set(trans.nextPbIndex, texts);
+                    const nextIndex = addedCodes.length;
+                    dp[nextIndex][trans.nextPbIndex] = [candidates[firstIdx].char];
                 }
 
-                // DPメインループ: 左から独立に状態を確定させていく
-                for (let mIndex = 0; mIndex < targetM.length; mIndex++) {
-                    const stateMap = dp[mIndex];
-                    if (stateMap.size === 0) continue;
+                for (let mIndex = 0; mIndex < targetMLen; mIndex++) {
+                    const stateArr = dp[mIndex];
                     
-                    for (const [pbIndex, texts] of stateMap.entries()) {
+                    for (let pbIndex = 0; pbIndex < numValidPbs; pbIndex++) {
+                        const texts = stateArr[pbIndex];
+                        if (!texts) continue;
+                        
                         for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
                             const trans2 = getTransition(pbIndex, cIdx);
-                            const addedStr2 = trans2.str;
+                            const addedCodes2 = trans2.strCodes;
+                            const addedLen2 = addedCodes2.length;
                             
                             let match2 = true;
-                            if (mIndex + addedStr2.length > targetM.length) {
+                            if (mIndex + addedLen2 > targetMLen) {
                                 match2 = false;
                             } else {
-                                for (let k = 0; k < addedStr2.length; k++) {
-                                    if (targetM[mIndex + k] !== addedStr2[k]) {
+                                for (let k = 0; k < addedLen2; k++) {
+                                    if (targetMCodes[mIndex + k] !== addedCodes2[k]) {
                                         match2 = false;
                                         break;
                                     }
@@ -169,16 +213,16 @@
                             }
                             
                             if (match2) {
-                                const nextIndex2 = mIndex + addedStr2.length;
+                                const nextIndex2 = mIndex + addedLen2;
                                 const charToAdd = candidates[cIdx].char;
+                                const nextPbIdx2 = trans2.nextPbIndex;
                                 
-                                let nextTexts = dp[nextIndex2].get(trans2.nextPbIndex);
+                                let nextTexts = dp[nextIndex2][nextPbIdx2];
                                 if (!nextTexts) {
                                     nextTexts = [];
-                                    dp[nextIndex2].set(trans2.nextPbIndex, nextTexts);
+                                    dp[nextIndex2][nextPbIdx2] = nextTexts;
                                 }
                                 
-                                // 同じ「確定文字数」と「持ち越しバイト」の状態に全て合流させる
                                 for (let i = 0; i < texts.length; i++) {
                                     nextTexts.push(texts[i] + charToAdd);
                                 }
@@ -187,27 +231,16 @@
                     }
                 }
 
-                // 終了判定: 最終的な文字数と状態がターゲットに完全一致するか
-                for (let mIndex = 0; mIndex <= targetM.length; mIndex++) {
-                    const stateMap = dp[mIndex];
-                    for (const [pbIndex, texts] of stateMap.entries()) {
-                        const pb = validPbs[pbIndex];
-                        let finalStr = "";
-                        
-                        // 文字列終了時に持ち越しバイトが残っている場合、代替文字に強制変換される
-                        if (pb !== -1) {
-                            finalStr = "\\uFFFD";
-                        }
-                        
-                        if (mIndex + finalStr.length === targetM.length) {
-                            let matchFinal = true;
-                            for (let k = 0; k < finalStr.length; k++) {
-                                if (targetM[mIndex + k] !== finalStr[k]) {
-                                    matchFinal = false;
-                                    break;
-                                }
-                            }
-                            if (matchFinal) {
+                for (let pbIndex = 0; pbIndex < numValidPbs; pbIndex++) {
+                    const pb = validPbs[pbIndex];
+                    if (pb === -1) {
+                        const texts = dp[targetMLen][pbIndex];
+                        if (texts) results.push(...texts);
+                    } else {
+                        const mIndexCheck = targetMLen - 1; 
+                        if (mIndexCheck >= 0) {
+                            const texts = dp[mIndexCheck][pbIndex];
+                            if (texts && targetMCodes[mIndexCheck] === 0xFFFD) {
                                 results.push(...texts);
                             }
                         }
@@ -227,11 +260,11 @@
     let workers = [];
 
     document.getElementById('restoreBtn').addEventListener('click', () => {
-        const targetM = document.getElementById('garbledText').value;
+        const fullTargetText = document.getElementById('garbledText').value;
         const restoredArea = document.getElementById('restoredText');
         const statusDiv = document.getElementById('status');
         
-        if (!targetM) return;
+        if (!fullTargetText) return;
 
         workers.forEach(w => w.terminate());
         workers = [];
@@ -244,53 +277,154 @@
         const numCores = navigator.hardwareConcurrency || 4;
         const chunkSize = Math.ceil(totalCandidates / numCores);
 
-        let completedWorkers = 0;
-        let allResults = [];
-        let processedTopLevel = 0;
+        const chunks = [];
+        let currentIsAscii = null;
+        let currentStr = "";
+
+        for (let i = 0; i < fullTargetText.length; i++) {
+            const code = fullTargetText.charCodeAt(i);
+            const isAscii = code <= 0x7F;
+            
+            if (currentIsAscii === null) {
+                currentIsAscii = isAscii;
+                currentStr += fullTargetText[i];
+            } else if (currentIsAscii === isAscii) {
+                currentStr += fullTargetText[i];
+            } else {
+                chunks.push({ isAscii: currentIsAscii, text: currentStr });
+                currentIsAscii = isAscii;
+                currentStr = fullTargetText[i];
+            }
+        }
+        if (currentStr.length > 0) {
+            chunks.push({ isAscii: currentIsAscii, text: currentStr });
+        }
+
+        const chunkResults = new Array(chunks.length);
+        const garbledChunks = chunks.map((c, idx) => ({...c, originalIndex: idx})).filter(c => !c.isAscii);
+        let currentGarbledChunkIndex = 0;
         const startTime = performance.now();
 
-        statusDiv.innerText = `探索中... (0.00%) - ${numCores}スレッドで並列処理中`;
+        chunks.forEach((c, idx) => {
+            if (c.isAscii) chunkResults[idx] = [c.text];
+        });
 
-        for (let i = 0; i < numCores; i++) {
-            const startIdx = i * chunkSize;
-            const endIdx = Math.min(startIdx + chunkSize, totalCandidates);
+        function processNextGarbledChunk() {
+            if (currentGarbledChunkIndex >= garbledChunks.length) {
+                generateFinalResults();
+                return;
+            }
+
+            const chunkInfo = garbledChunks[currentGarbledChunkIndex];
+            const targetM = chunkInfo.text;
             
-            if (startIdx >= totalCandidates) break;
+            const targetMCodes = new Uint16Array(targetM.length);
+            for(let i=0; i<targetM.length; i++) {
+                targetMCodes[i] = targetM.charCodeAt(i);
+            }
 
-            const worker = new Worker(URL.createObjectURL(blob));
-            workers.push(worker);
+            let completedWorkers = 0;
+            let allResultsForChunk = [];
+            let processedTopLevel = 0;
 
-            worker.onmessage = function(e) {
-                if (e.data.type === 'progress_tick') {
-                    processedTopLevel++;
-                    const percent = ((processedTopLevel / totalCandidates) * 100).toFixed(2);
-                    statusDiv.innerText = `探索中... (${percent}%) - ${numCores}スレッドで並列処理中`;
-                } else if (e.data.type === 'done') {
-                    allResults = allResults.concat(e.data.results);
-                    completedWorkers++;
+            statusDiv.innerText = `解析中... チャンク ${currentGarbledChunkIndex + 1}/${garbledChunks.length} (0.00%) - ${numCores}スレッド`;
 
-                    if (completedWorkers === workers.length) {
-                        const timeStr = ((performance.now() - startTime) / 1000).toFixed(2);
-                        statusDiv.innerText = `完了: ${timeStr}秒 で全探索を完了しました。`;
-                        
-                        if (allResults.length > 0) {
-                            // ロスにより候補が爆発した場合のブラウザクラッシュ対策 (5万件で打ち切り)
-                            if (allResults.length > 50000) {
-                                allResults = allResults.slice(0, 50000);
-                                allResults.push("... (※情報欠落による候補が多すぎるため、5万件で表示を打ち切りました)");
-                            }
-                            restoredArea.value = "【復元完了】以下の候補が見つかりました:\n" + allResults.join("\n");
-                        } else {
-                            restoredArea.value = "復元候補が見つかりませんでした。";
+            for (let i = 0; i < numCores; i++) {
+                const startIdx = i * chunkSize;
+                const endIdx = Math.min(startIdx + chunkSize, totalCandidates);
+                if (startIdx >= totalCandidates) break;
+
+                const worker = new Worker(URL.createObjectURL(blob));
+                workers.push(worker);
+
+                worker.onmessage = function(e) {
+                    if (e.data.type === 'progress_tick') {
+                        processedTopLevel++;
+                        const percent = ((processedTopLevel / totalCandidates) * 100).toFixed(2);
+                        statusDiv.innerText = `解析中... チャンク ${currentGarbledChunkIndex + 1}/${garbledChunks.length} (${percent}%) - ${numCores}スレッド`;
+                    } else if (e.data.type === 'done') {
+                        allResultsForChunk = allResultsForChunk.concat(e.data.results);
+                        completedWorkers++;
+
+                        if (completedWorkers === workers.length) {
+                            chunkResults[chunkInfo.originalIndex] = allResultsForChunk.length > 0 ? allResultsForChunk : ["(復元不能)"];
+                            workers.forEach(w => w.terminate());
+                            workers = [];
+                            
+                            currentGarbledChunkIndex++;
+                            processNextGarbledChunk();
                         }
-                        workers.forEach(w => w.terminate());
-                        workers = [];
+                    }
+                };
+
+                worker.postMessage({ targetMCodes: targetMCodes, startIdx: startIdx, endIdx: endIdx });
+            }
+        }
+
+        function generateFinalResults() {
+            const maxDisplay = parseInt(document.getElementById('maxLimit').value, 10) || 256;
+            
+            let currentCombos = [""];
+            let generalForm = "";
+            let hasAmbiguity = false;
+
+            for (let i = 0; i < chunks.length; i++) {
+                const candidates = chunkResults[i];
+                const originalText = chunks[i].text;
+                
+                // そのチャンクに対する非可逆デコード(予測文字列)を取得
+                const predicted = getStandardDecodedText(originalText);
+
+                // --- 1. 一般形の構築 ---
+                // 走査で候補が1つに確定していれば確定文字を、それ以外（複数候補や復元不能）は予測文字列を採用
+                if (candidates.length === 1 && !candidates.includes("(復元不能)")) {
+                    generalForm += candidates[0];
+                } else {
+                    generalForm += predicted;
+                    hasAmbiguity = true;
+                }
+
+                // --- 2. 組み合わせ候補リストの構築 ---
+                const nextCombos = [];
+                for (const baseStr of currentCombos) {
+                    for (const cand of candidates) {
+                        let part = cand;
+                        // 復元不能部分はリスト上でも分かりやすいように予測文字列を埋め込む
+                        if (cand === "(復元不能)") {
+                            part = `【予測:${predicted}】`;
+                        }
+                        nextCombos.push(baseStr + part);
+                        if (nextCombos.length >= maxDisplay) break;
+                    }
+                    if (nextCombos.length >= maxDisplay) break;
+                }
+                currentCombos = nextCombos;
+            }
+            
+            const timeStr = ((performance.now() - startTime) / 1000).toFixed(2);
+            statusDiv.innerText = `完了: ${timeStr}秒 で全解析・結合を完了しました。`;
+            
+            let outputText = "【復元完了】\n";
+
+            // 結果の出力
+            if (hasAmbiguity) {
+                outputText += `■ 一般形 (走査での確定部分 ＋ 非可逆予測部分):\n${generalForm}\n\n`;
+                if (currentCombos.length > 0) {
+                    outputText += `■ 探索による復元候補 (最大 ${maxDisplay} 件):\n`;
+                    outputText += currentCombos.join("\n");
+                    if (currentCombos.length >= maxDisplay) {
+                        outputText += `\n... (※指定された最大表示個数 ${maxDisplay} 件で打ち切りました)`;
                     }
                 }
-            };
-
-            worker.postMessage({ targetM: targetM, startIdx: startIdx, endIdx: endIdx });
+            } else {
+                // すべて完全一致の場合は一般形＝最終候補となるためシンプルに表示
+                outputText += `■ 復元文字列 (完全一致):\n${generalForm}\n`;
+            }
+            
+            restoredArea.value = outputText;
         }
+
+        processNextGarbledChunk();
     });
 </script>
 
