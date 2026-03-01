@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UTF-8 -> SJIS 文字化け＆復号</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 20px auto; }
+        textarea { width: 100%; height: 80px; margin-bottom: 10px; padding: 5px; box-sizing: border-box; resize: vertical; }
+        button { display: block; margin: 0 auto 15px auto; padding: 8px 16px; cursor: pointer; font-weight: bold; }
+        .container { display: flex; flex-direction: column; }
+        #status { text-align: center; color: #555; font-size: 0.9em; margin-bottom: 10px; height: 1.2em;}
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <label for="plainText">平文入力テキストエリア</label>
+    <textarea id="plainText"></textarea>
+
+    <button id="garbleBtn">文字化けボタン（下に出力）</button>
+
+    <label for="garbledText">文字化け入力テキストエリア</label>
+    <textarea id="garbledText"></textarea>
+
+    <button id="restoreBtn">復号化ボタン（下に出力）</button>
+
+    <div id="status"></div>
+
+    <label for="restoredText">復元した文字列テキストエリア</label>
+    <textarea id="restoredText"></textarea>
+</div>
+
+<script>
+    // 1. 文字化け処理
+    const encoder = new TextEncoder();
+    const sjisDecoder = new TextDecoder('shift-jis');
+
+    document.getElementById('garbleBtn').addEventListener('click', () => {
+        const plainText = document.getElementById('plainText').value;
+        const utf8Bytes = encoder.encode(plainText);
+        const garbledStr = sjisDecoder.decode(utf8Bytes);
+        document.getElementById('garbledText').value = garbledStr;
+    });
+
+    // 2. 復号処理 (Web Worker用のコード)
+    const workerCode = `
+        const encoder = new TextEncoder();
+        // fatal: false にして代替文字(\uFFFD)のロスをシミュレートする
+        const decoder = new TextDecoder('shift-jis', {fatal: false});
+        
+        const charRanges = [
+            [0x0020, 0x007E], // ASCII
+            [0x3000, 0x303F], // 句読点
+            [0x3041, 0x309F], // ひらがな
+            [0x30A1, 0x30FF], // カタカナ
+            [0xFF01, 0xFF5E], // 全角英数字
+            [0x4E00, 0x9FAF]  // 漢字
+        ];
+        
+        const candidates = [];
+        for (const [start, end] of charRanges) {
+            for (let i = start; i <= end; i++) {
+                const char = String.fromCodePoint(i);
+                candidates.push({ char: char, bytes: encoder.encode(char) });
+            }
+        }
+
+        // SJISの未確定（持ち越し）バイトのパターン (-1は持ち越しなし)
+        const validPbs = [-1];
+        for (let i = 0x81; i <= 0x9F; i++) validPbs.push(i);
+        for (let i = 0xE0; i <= 0xFC; i++) validPbs.push(i);
+
+        const pbToIndex = new Map();
+        validPbs.forEach((pb, idx) => pbToIndex.set(pb, idx));
+
+        // 状態遷移の遅延評価用キャッシュ（高速化）
+        const transitions = new Array(validPbs.length);
+        for (let i = 0; i < validPbs.length; i++) {
+            transitions[i] = new Array(candidates.length).fill(null);
+        }
+
+        // ストリームデコードを用いて、文字を追加した際の「確定文字列」と「次への持ち越しバイト」を計算する
+        function getTransition(pbIndex, cIdx) {
+            if (transitions[pbIndex][cIdx]) return transitions[pbIndex][cIdx];
+            
+            const pb = validPbs[pbIndex];
+            const candBytes = candidates[cIdx].bytes;
+            
+            let input;
+            if (pb === -1) {
+                input = candBytes;
+            } else {
+                input = new Uint8Array(candBytes.length + 1);
+                input[0] = pb;
+                input.set(candBytes, 1);
+            }
+            
+            const str = decoder.decode(input, {stream: true});
+            const remainder = decoder.decode(new Uint8Array(0)); // バッファのフラッシュ
+            
+            let nextPb = -1;
+            if (remainder !== "") {
+                // バッファに解釈待ちが残っている場合、最後の1バイトがSJIS第1バイト
+                nextPb = input[input.length - 1];
+            }
+            
+            const trans = { str, nextPbIndex: pbToIndex.get(nextPb) };
+            transitions[pbIndex][cIdx] = trans;
+            return trans;
+        }
+
+        self.onmessage = function(e) {
+            const targetM = e.data.targetM;
+            const startIdx = e.data.startIdx;
+            const endIdx = e.data.endIdx;
+            
+            const results = [];
+            let searchCount = 0;
+
+            // Workerに割り当てられた初期文字（1文字目）ごとに独立してDPを実行する
+            for (let firstIdx = startIdx; firstIdx < endIdx; firstIdx++) {
+                // dp[mIndex] = Map: pbIndex -> Array of texts
+                const dp = new Array(targetM.length + 1);
+                for(let i = 0; i <= targetM.length; i++) dp[i] = new Map();
+                
+                const trans = getTransition(0, firstIdx); // 0は pb=-1 (持ち越しなし)
+                const addedStr = trans.str;
+                
+                let match = true;
+                if (addedStr.length > targetM.length) {
+                    match = false;
+                } else {
+                    for (let k = 0; k < addedStr.length; k++) {
+                        if (targetM[k] !== addedStr[k]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                }
+                
+                // 1文字目がターゲットの接頭辞として成立する場合のみ登録
+                if (match) {
+                    const nextIndex = addedStr.length;
+                    const texts = [candidates[firstIdx].char];
+                    dp[nextIndex].set(trans.nextPbIndex, texts);
+                }
+
+                // DPメインループ: 左から独立に状態を確定させていく
+                for (let mIndex = 0; mIndex < targetM.length; mIndex++) {
+                    const stateMap = dp[mIndex];
+                    if (stateMap.size === 0) continue;
+                    
+                    for (const [pbIndex, texts] of stateMap.entries()) {
+                        for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+                            const trans2 = getTransition(pbIndex, cIdx);
+                            const addedStr2 = trans2.str;
+                            
+                            let match2 = true;
+                            if (mIndex + addedStr2.length > targetM.length) {
+                                match2 = false;
+                            } else {
+                                for (let k = 0; k < addedStr2.length; k++) {
+                                    if (targetM[mIndex + k] !== addedStr2[k]) {
+                                        match2 = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (match2) {
+                                const nextIndex2 = mIndex + addedStr2.length;
+                                const charToAdd = candidates[cIdx].char;
+                                
+                                let nextTexts = dp[nextIndex2].get(trans2.nextPbIndex);
+                                if (!nextTexts) {
+                                    nextTexts = [];
+                                    dp[nextIndex2].set(trans2.nextPbIndex, nextTexts);
+                                }
+                                
+                                // 同じ「確定文字数」と「持ち越しバイト」の状態に全て合流させる
+                                for (let i = 0; i < texts.length; i++) {
+                                    nextTexts.push(texts[i] + charToAdd);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 終了判定: 最終的な文字数と状態がターゲットに完全一致するか
+                for (let mIndex = 0; mIndex <= targetM.length; mIndex++) {
+                    const stateMap = dp[mIndex];
+                    for (const [pbIndex, texts] of stateMap.entries()) {
+                        const pb = validPbs[pbIndex];
+                        let finalStr = "";
+                        
+                        // 文字列終了時に持ち越しバイトが残っている場合、代替文字に強制変換される
+                        if (pb !== -1) {
+                            finalStr = "\\uFFFD";
+                        }
+                        
+                        if (mIndex + finalStr.length === targetM.length) {
+                            let matchFinal = true;
+                            for (let k = 0; k < finalStr.length; k++) {
+                                if (targetM[mIndex + k] !== finalStr[k]) {
+                                    matchFinal = false;
+                                    break;
+                                }
+                            }
+                            if (matchFinal) {
+                                results.push(...texts);
+                            }
+                        }
+                    }
+                }
+                
+                searchCount++;
+                self.postMessage({ type: 'progress_tick', count: searchCount });
+                searchCount = 0;
+            }
+
+            self.postMessage({ type: 'done', results: results });
+        };
+    `;
+
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    let workers = [];
+
+    document.getElementById('restoreBtn').addEventListener('click', () => {
+        const targetM = document.getElementById('garbledText').value;
+        const restoredArea = document.getElementById('restoredText');
+        const statusDiv = document.getElementById('status');
+        
+        if (!targetM) return;
+
+        workers.forEach(w => w.terminate());
+        workers = [];
+        restoredArea.value = "";
+        
+        let totalCandidates = 0;
+        const charRanges = [[0x0020, 0x007E], [0x3000, 0x303F], [0x3041, 0x309F], [0x30A1, 0x30FF], [0xFF01, 0xFF5E], [0x4E00, 0x9FAF]];
+        for (const [start, end] of charRanges) { totalCandidates += (end - start + 1); }
+
+        const numCores = navigator.hardwareConcurrency || 4;
+        const chunkSize = Math.ceil(totalCandidates / numCores);
+
+        let completedWorkers = 0;
+        let allResults = [];
+        let processedTopLevel = 0;
+        const startTime = performance.now();
+
+        statusDiv.innerText = `探索中... (0.00%) - ${numCores}スレッドで並列処理中`;
+
+        for (let i = 0; i < numCores; i++) {
+            const startIdx = i * chunkSize;
+            const endIdx = Math.min(startIdx + chunkSize, totalCandidates);
+            
+            if (startIdx >= totalCandidates) break;
+
+            const worker = new Worker(URL.createObjectURL(blob));
+            workers.push(worker);
+
+            worker.onmessage = function(e) {
+                if (e.data.type === 'progress_tick') {
+                    processedTopLevel++;
+                    const percent = ((processedTopLevel / totalCandidates) * 100).toFixed(2);
+                    statusDiv.innerText = `探索中... (${percent}%) - ${numCores}スレッドで並列処理中`;
+                } else if (e.data.type === 'done') {
+                    allResults = allResults.concat(e.data.results);
+                    completedWorkers++;
+
+                    if (completedWorkers === workers.length) {
+                        const timeStr = ((performance.now() - startTime) / 1000).toFixed(2);
+                        statusDiv.innerText = `完了: ${timeStr}秒 で全探索を完了しました。`;
+                        
+                        if (allResults.length > 0) {
+                            // ロスにより候補が爆発した場合のブラウザクラッシュ対策 (5万件で打ち切り)
+                            if (allResults.length > 50000) {
+                                allResults = allResults.slice(0, 50000);
+                                allResults.push("... (※情報欠落による候補が多すぎるため、5万件で表示を打ち切りました)");
+                            }
+                            restoredArea.value = "【復元完了】以下の候補が見つかりました:\n" + allResults.join("\n");
+                        } else {
+                            restoredArea.value = "復元候補が見つかりませんでした。";
+                        }
+                        workers.forEach(w => w.terminate());
+                        workers = [];
+                    }
+                }
+            };
+
+            worker.postMessage({ targetM: targetM, startIdx: startIdx, endIdx: endIdx });
+        }
+    });
+</script>
+
+</body>
+</html>
